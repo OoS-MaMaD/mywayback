@@ -33,18 +33,16 @@ func CompileExtRegex(includeCSV, excludeCSV string) (*regexp.Regexp, bool, error
 
 // uniqueAndSort removes duplicates and sorts
 func uniqueAndSort(lines []string) []string {
-	seen := map[string]struct{}{}
+	seen := make(map[string]bool)
 	out := []string{}
+
 	for _, l := range lines {
-		if l == "" {
-			continue
+		if !seen[l] {
+			seen[l] = true
+			out = append(out, l)
 		}
-		if _, ok := seen[l]; ok {
-			continue
-		}
-		seen[l] = struct{}{}
-		out = append(out, l)
 	}
+
 	sort.Strings(out)
 	return out
 }
