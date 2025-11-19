@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -151,12 +150,9 @@ func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, i
 				}
 				if onlyQueryKeys {
 					if err == nil && u.RawQuery != "" {
-						keys := []string{}
 						for k := range u.Query() {
-							keys = append(keys, k)
+							results <- k // each key on its own line
 						}
-						sort.Strings(keys)
-						results <- strings.Join(keys, "&")
 					}
 					continue
 				}
