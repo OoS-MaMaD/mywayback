@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,32 +36,66 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build CDX URL
-	cdxURL := "https://web.archive.org/cdx/search/cdx?url=" +
-		url.QueryEscape(normalizeURL(*urlFlag)) +
-		"&fl=original&collapse=urlkey"
-
-	// Fetch CDX
+	// Create HTTP client
 	client := &http.Client{Timeout: time.Duration(*timeout) * time.Second}
-	resp, err := client.Get(cdxURL)
+
+	// First request: get number of pages
+	pagesURL := "http://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&showNumPages=true"
+	resp, err := client.Get(pagesURL)
 	if err != nil {
-		fmt.Println("❌ ERROR fetching CDX:", err)
+		fmt.Println("❌ ERROR fetching page count from CDX:", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
-
 	scanner := bufio.NewScanner(resp.Body)
-	lines := []string{}
+	numStr := ""
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			lines = append(lines, line)
+		s := strings.TrimSpace(scanner.Text())
+		if s != "" {
+			numStr = s
+			break
+		}
+	}
+	resp.Body.Close()
+	if err := scanner.Err(); err != nil {
+		fmt.Println("❌ ERROR reading page-count response:", err)
+		os.Exit(1)
+	}
+
+	pages := 0
+	if numStr == "" {
+		// no pages returned -> nothing to fetch
+		pages = 0
+	} else {
+		if n, err := strconv.Atoi(numStr); err == nil {
+			pages = n
+		} else {
+			// Could not parse page count; attempt to continue with a single page
+			fmt.Println("⚠ WARNING: could not parse page count (", numStr, "), defaulting to 1 page")
+			pages = 1
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		fmt.Println("❌ ERROR reading CDX:", err)
-		os.Exit(1)
+	// Fetch each page and collect lines
+	lines := []string{}
+	for p := 0; p < pages; p++ {
+		pageURL := "https://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&page=" + strconv.Itoa(p) + "&fl=original&collapse=urlkey"
+		resp, err := client.Get(pageURL)
+		if err != nil {
+			fmt.Println("❌ ERROR fetching CDX page", p, ":", err)
+			// continue to next page
+			continue
+		}
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+		if err := sc.Err(); err != nil {
+			fmt.Println("⚠ WARNING: error reading CDX page", p, ":", err)
+		}
+		resp.Body.Close()
 	}
 
 	// Compile extension filters
@@ -150,7 +185,26 @@ func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, i
 				}
 				if onlyQueryKeys {
 					if err == nil && u.RawQuery != "" {
-						for k := range u.Query() {
+						// Robustly split the raw query into pairs on '&' and ';' so
+						// URLs that the parser may not split correctly still yield
+						// individual parameter keys.
+						pairs := strings.FieldsFunc(u.RawQuery, func(r rune) bool {
+							return r == '&' || r == ';'
+						})
+						for _, p := range pairs {
+							if p == "" {
+								continue
+							}
+							k := p
+							if idx := strings.Index(p, "="); idx >= 0 {
+								k = p[:idx]
+							}
+							if k == "" {
+								continue
+							}
+							if un, err := url.QueryUnescape(k); err == nil {
+								k = un
+							}
 							results <- k // each key on its own line
 						}
 					}
