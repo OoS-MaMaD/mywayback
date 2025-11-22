@@ -29,7 +29,7 @@ func main() {
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
 	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
 	pageWorkers := flag.Int("page-workers", 5, "Number of concurrent page fetchers (CDX pages)")
-	timeout := flag.Int("timeout", 100, "HTTP timeout in seconds")
+	timeout := flag.Int("timeout", 80, "HTTP timeout in seconds")
 	flag.Parse()
 
 	if *urlFlag == "" {
