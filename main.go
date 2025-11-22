@@ -29,7 +29,7 @@ func main() {
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
 	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
 	pageWorkers := flag.Int("page-workers", 5, "Number of concurrent page fetchers (CDX pages)")
-	timeout := flag.Int("timeout", 50, "HTTP timeout in seconds")
+	timeout := flag.Int("timeout", 100, "HTTP timeout in seconds")
 	flag.Parse()
 
 	if *urlFlag == "" {
@@ -140,16 +140,16 @@ func main() {
 					if respP != nil {
 						respP.Body.Close()
 					}
-					// Print retry message (clear bar first so output is clean)
-					pbar.ClearLine()
-					fmt.Fprintf(os.Stderr, "⚠ retrying page %d (attempt %d) after error: %v\n", p, attempt, ierr)
+					// Print retry message (show as status on the progress bar so stdout isn't interrupted)
+					msg := fmt.Sprintf("⚠ retrying page %d (attempt %d) after error: %v", p, attempt, ierr)
+					pbar.Log(msg, "\033[33m")
 					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
 					// backoff
 					time.Sleep(time.Duration(attempt) * time.Second)
 				}
 				if ierr != nil || respP == nil {
-					pbar.ClearLine()
-					fmt.Fprintf(os.Stderr, "❌ ERROR fetching CDX page %d: %v\n", p, ierr)
+					msg := fmt.Sprintf("❌ ERROR fetching CDX page %d: %v", p, ierr)
+					pbar.Log(msg, "\033[31m")
 					atomic.AddInt32(&pagesCompleted, 1)
 					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
 					continue
@@ -163,8 +163,8 @@ func main() {
 					}
 				}
 				if err := sc.Err(); err != nil {
-					pbar.ClearLine()
-					fmt.Fprintf(os.Stderr, "⚠ WARNING: error reading CDX page %d: %v\n", p, err)
+					msg := fmt.Sprintf("⚠ WARNING: error reading CDX page %d: %v", p, err)
+					pbar.Log(msg, "\033[33m")
 					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
 				}
 				respP.Body.Close()
