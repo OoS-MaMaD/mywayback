@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,140 +27,165 @@ func main() {
 	noQuery := flag.Bool("no-query", false, "Remove query strings from URLs")
 	excludeExt := flag.String("exclude-ext", defaultExclude, "Comma-separated list of extensions to exclude")
 	includeExt := flag.String("include-ext", "", "Comma-separated list of extensions to include (overrides exclude)")
-	workers := flag.Int("workers", 20, "Number of concurrent workers")
-	timeout := flag.Int("timeout", 15, "HTTP timeout in seconds")
+	workers := flag.Int("workers", 20, "Number of concurrent processing workers (for URL lines)")
+	pageWorkers := flag.Int("page-workers", 5, "Number of concurrent page fetchers (CDX pages)")
+	timeout := flag.Int("timeout", 50, "HTTP timeout in seconds")
 	flag.Parse()
 
 	if *urlFlag == "" {
-		fmt.Println("❌ ERROR: -u <url> is required")
+		fmt.Fprintln(os.Stderr, "❌ ERROR: -u <url> is required")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Create HTTP client
 	client := &http.Client{Timeout: time.Duration(*timeout) * time.Second}
 
-	// First request: get number of pages
+	// 1) Request number of pages
 	pagesURL := "http://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&showNumPages=true"
 	resp, err := client.Get(pagesURL)
 	if err != nil {
-		fmt.Println("❌ ERROR fetching page count from CDX:", err)
+		fmt.Fprintln(os.Stderr, "❌ ERROR fetching page count from CDX:", err)
 		os.Exit(1)
 	}
 	scanner := bufio.NewScanner(resp.Body)
 	numStr := ""
 	for scanner.Scan() {
-		s := strings.TrimSpace(scanner.Text())
-		if s != "" {
-			numStr = s
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			numStr = line
 			break
 		}
 	}
 	resp.Body.Close()
 	if err := scanner.Err(); err != nil {
-		fmt.Println("❌ ERROR reading page-count response:", err)
+		fmt.Fprintln(os.Stderr, "❌ ERROR reading page-count response:", err)
 		os.Exit(1)
 	}
 
 	pages := 0
 	if numStr == "" {
-		// no pages returned -> nothing to fetch
 		pages = 0
 	} else {
 		if n, err := strconv.Atoi(numStr); err == nil {
 			pages = n
 		} else {
-			// Could not parse page count; attempt to continue with a single page
-			fmt.Println("⚠ WARNING: could not parse page count (", numStr, "), defaulting to 1 page")
+			fmt.Fprintln(os.Stderr, "⚠ WARNING: could not parse page count (", numStr, "), defaulting to 1 page")
 			pages = 1
 		}
-	}
-
-	// Fetch each page and collect lines
-	lines := []string{}
-	for p := 0; p < pages; p++ {
-		pageURL := "https://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&page=" + strconv.Itoa(p) + "&fl=original&collapse=urlkey"
-		resp, err := client.Get(pageURL)
-		if err != nil {
-			fmt.Println("❌ ERROR fetching CDX page", p, ":", err)
-			// continue to next page
-			continue
-		}
-		sc := bufio.NewScanner(resp.Body)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if line != "" {
-				lines = append(lines, line)
-			}
-		}
-		if err := sc.Err(); err != nil {
-			fmt.Println("⚠ WARNING: error reading CDX page", p, ":", err)
-		}
-		resp.Body.Close()
 	}
 
 	// Compile extension filters
 	extRegex, includeMode, err := CompileExtRegex(*includeExt, *excludeExt)
 	if err != nil {
-		fmt.Println("❌ ERROR compiling extension regex:", err)
+		fmt.Fprintln(os.Stderr, "❌ ERROR compiling extension regex:", err)
 		os.Exit(1)
 	}
 
-	// Process URLs concurrently
-	results := processConcurrently(lines, *workers, extRegex, includeMode, *onlyQuery, *onlyQueryKeys, *noQuery)
-
-	// Deduplicate & sort
-	final := uniqueAndSort(results)
-
-	// Output
+	// Prepare output writer
+	var outFile *os.File
+	var outWriter io.Writer = os.Stdout
 	if *outputFile != "" {
 		f, err := os.Create(*outputFile)
 		if err != nil {
-			fmt.Println("❌ ERROR creating output file:", err)
+			fmt.Fprintln(os.Stderr, "❌ ERROR creating output file:", err)
 			os.Exit(1)
 		}
-		defer f.Close()
-		w := bufio.NewWriter(io.MultiWriter(os.Stdout, f))
-		for _, l := range final {
-			fmt.Fprintln(w, l)
-		}
-		w.Flush()
-		fmt.Println("✔ Saved results to", *outputFile)
-	} else {
-		for _, l := range final {
-			fmt.Println(l)
-		}
+		outFile = f
+		outWriter = io.MultiWriter(os.Stdout, outFile)
 	}
-}
 
-// normalizeURL ensures the pattern ends with * if missing
-func normalizeURL(u string) string {
-	u = strings.TrimSpace(u)
-	u = strings.TrimPrefix(u, "http://")
-	u = strings.TrimPrefix(u, "https://")
-	if !strings.Contains(u, "*") {
-		u += "*"
+	if pages == 0 {
+		// nothing to fetch; exit gracefully
+		fmt.Fprintln(os.Stderr, "No pages reported by CDX; nothing to do.")
+		if outFile != nil {
+			outFile.Close()
+		}
+		return
 	}
-	return u
-}
 
-// processConcurrently filters and processes URLs with a worker pool
-func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, includeMode bool, onlyQuery, onlyQueryKeys, noQuery bool) []string {
-	jobs := make(chan string)
-	results := make(chan string, len(lines))
+	// Create progress bar
+	pbar := NewPBar(pages)
+	pbar.Render(0)
 
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
+	// Channels
+	pageJobs := make(chan int, *pageWorkers)
+	jobs := make(chan string, 2000)
+	resultsCh := make(chan string, 2000)
+
+	var pagesCompleted int32 = 0
+
+	// Page fetchers
+	var fetchWg sync.WaitGroup
+	pageConcurrency := *pageWorkers
+	if pageConcurrency < 1 {
+		pageConcurrency = 1
+	}
+	if pages < pageConcurrency {
+		pageConcurrency = pages
+	}
+	maxRetries := 3
+	for i := 0; i < pageConcurrency; i++ {
+		fetchWg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer fetchWg.Done()
+			for p := range pageJobs {
+				pageURL := "https://web.archive.org/cdx/search/cdx?url=" + url.QueryEscape(normalizeURL(*urlFlag)) + "&page=" + strconv.Itoa(p) + "&fl=original&collapse=urlkey"
+				var respP *http.Response
+				var ierr error
+				for attempt := 1; attempt <= maxRetries; attempt++ {
+					respP, ierr = client.Get(pageURL)
+					if ierr == nil && respP != nil && respP.StatusCode >= 200 && respP.StatusCode < 300 {
+						break
+					}
+					if respP != nil {
+						respP.Body.Close()
+					}
+					// Print retry message (clear bar first so output is clean)
+					pbar.ClearLine()
+					fmt.Fprintf(os.Stderr, "⚠ retrying page %d (attempt %d) after error: %v\n", p, attempt, ierr)
+					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+					// backoff
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
+				if ierr != nil || respP == nil {
+					pbar.ClearLine()
+					fmt.Fprintf(os.Stderr, "❌ ERROR fetching CDX page %d: %v\n", p, ierr)
+					atomic.AddInt32(&pagesCompleted, 1)
+					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+					continue
+				}
+
+				sc := bufio.NewScanner(respP.Body)
+				for sc.Scan() {
+					line := strings.TrimSpace(sc.Text())
+					if line != "" {
+						jobs <- line
+					}
+				}
+				if err := sc.Err(); err != nil {
+					pbar.ClearLine()
+					fmt.Fprintf(os.Stderr, "⚠ WARNING: error reading CDX page %d: %v\n", p, err)
+					pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+				}
+				respP.Body.Close()
+				atomic.AddInt32(&pagesCompleted, 1)
+				pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+			}
+		}()
+	}
+
+	// Processing workers
+	var workerWg sync.WaitGroup
+	for i := 0; i < *workers; i++ {
+		workerWg.Add(1)
+		go func() {
+			defer workerWg.Done()
 			for line := range jobs {
 				line = strings.TrimSpace(line)
 				if line == "" {
 					continue
 				}
 
-				// parse URL to get path only for extension check
 				u, err := url.Parse(line)
 				path := line
 				if err == nil && u.Path != "" {
@@ -177,20 +203,15 @@ func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, i
 				}
 
 				// query modes
-				if onlyQuery {
+				if *onlyQuery {
 					if err == nil && u.RawQuery != "" {
-						results <- u.RawQuery
+						resultsCh <- u.RawQuery
 					}
 					continue
 				}
-				if onlyQueryKeys {
+				if *onlyQueryKeys {
 					if err == nil && u.RawQuery != "" {
-						// Robustly split the raw query into pairs on '&' and ';' so
-						// URLs that the parser may not split correctly still yield
-						// individual parameter keys.
-						pairs := strings.FieldsFunc(u.RawQuery, func(r rune) bool {
-							return r == '&' || r == ';'
-						})
+						pairs := strings.FieldsFunc(u.RawQuery, func(r rune) bool { return r == '&' || r == ';' })
 						for _, p := range pairs {
 							if p == "" {
 								continue
@@ -205,7 +226,135 @@ func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, i
 							if un, err := url.QueryUnescape(k); err == nil {
 								k = un
 							}
-							results <- k // each key on its own line
+							resultsCh <- k
+						}
+					}
+					continue
+				}
+				if *noQuery && err == nil {
+					u.RawQuery = ""
+					resultsCh <- u.String()
+					continue
+				}
+
+				// default
+				resultsCh <- line
+			}
+		}()
+	}
+
+	// Printer goroutine: dedupe and write immediately; keep progress bar at bottom
+	var printWg sync.WaitGroup
+	printWg.Add(1)
+	go func() {
+		defer printWg.Done()
+		seen := make(map[string]struct{})
+		bufw := bufio.NewWriter(outWriter)
+		for r := range resultsCh {
+			if _, ok := seen[r]; ok {
+				continue
+			}
+			seen[r] = struct{}{}
+			// clear progress bar, print the data line, flush and redraw bar
+			pbar.ClearLine()
+			fmt.Fprintln(bufw, r)
+			bufw.Flush()
+			pbar.Render(int(atomic.LoadInt32(&pagesCompleted)))
+		}
+		if outFile != nil {
+			bufw.Flush()
+			outFile.Close()
+			fmt.Fprintln(os.Stdout, "✔ Saved results to", *outputFile)
+		}
+	}()
+
+	// Dispatch page numbers
+	for p := 0; p < pages; p++ {
+		pageJobs <- p
+	}
+	close(pageJobs)
+
+	// Wait for fetchers to finish
+	fetchWg.Wait()
+
+	// Close jobs and wait for workers
+	close(jobs)
+	workerWg.Wait()
+
+	// Close results and wait for printer
+	close(resultsCh)
+	printWg.Wait()
+
+	// finish progress bar line
+	pbar.Finish()
+}
+
+// normalizeURL ensures the pattern ends with * if missing
+func normalizeURL(u string) string {
+	u = strings.TrimSpace(u)
+	u = strings.TrimPrefix(u, "http://")
+	u = strings.TrimPrefix(u, "https://")
+	if !strings.Contains(u, "*") {
+		u += "*"
+	}
+	return u
+}
+
+// processConcurrently remains for compatibility but is not used by main
+func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, includeMode bool, onlyQuery, onlyQueryKeys, noQuery bool) []string {
+	jobs := make(chan string)
+	results := make(chan string, len(lines))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for line := range jobs {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+
+				u, err := url.Parse(line)
+				path := line
+				if err == nil && u.Path != "" {
+					path = u.Path
+				}
+
+				if extRegex != nil {
+					match := extRegex.MatchString(path)
+					if includeMode && !match {
+						continue
+					} else if !includeMode && match {
+						continue
+					}
+				}
+
+				if onlyQuery {
+					if err == nil && u.RawQuery != "" {
+						results <- u.RawQuery
+					}
+					continue
+				}
+				if onlyQueryKeys {
+					if err == nil && u.RawQuery != "" {
+						pairs := strings.FieldsFunc(u.RawQuery, func(r rune) bool { return r == '&' || r == ';' })
+						for _, p := range pairs {
+							if p == "" {
+								continue
+							}
+							k := p
+							if idx := strings.Index(p, "="); idx >= 0 {
+								k = p[:idx]
+							}
+							if k == "" {
+								continue
+							}
+							if un, err := url.QueryUnescape(k); err == nil {
+								k = un
+							}
+							results <- k
 						}
 					}
 					continue
@@ -216,7 +365,6 @@ func processConcurrently(lines []string, workers int, extRegex *regexp.Regexp, i
 					continue
 				}
 
-				// default: send the original URL
 				results <- line
 			}
 		}()
